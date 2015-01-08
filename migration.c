@@ -19,6 +19,7 @@
 #include "monitor/monitor.h"
 #include "migration/qemu-file.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/cpus.h"	/* add by wan */
 #include "block/block.h"
 #include "qemu/sockets.h"
 #include "migration/block.h"
@@ -101,13 +102,33 @@ static void process_incoming_migration_co(void *opaque)
 {
     QEMUFile *f = opaque;
     int ret;
+	
+	/* add by wan (*/
+	int count = 0;
 
-    ret = qemu_loadvm_state(f);
+  /*  ret = qemu_loadvm_state(f);
     qemu_fclose(f);
     if (ret < 0) {
         error_report("load of migration failed: %s", strerror(-ret));
         exit(EXIT_FAILURE);
-    }
+    }*/
+    if (ft_enabled()) {
+		while (qemu_loadvm_state_ft(f) >= 0) {
+			count++;
+			DPRINTF("incoming count %d\r", count);
+		}
+		qemu_fclose(f);
+		fprintf(stderr, "ft connection lost, launching self..\n");
+	} else {
+		ret = qemu_loadvm_state(f);
+		qemu_fclose(f);
+		if (ret < 0) {
+			fprintf(stderr, "load of migration failed\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+	cpu_synchronize_all_post_init();
+	/* add by wan )*/
     qemu_announce_self();
     DPRINTF("successfully loaded vm state\n");
 
@@ -553,6 +574,7 @@ static void *migration_thread(void *opaque)
     int64_t max_size = 0;
     int64_t start_time = initial_time;
     bool old_vm_running = false;
+	int time_window = 100;
 
     DPRINTF("beginning savevm\n");
     qemu_savevm_state_begin(s->file, &s->params);
@@ -564,6 +586,8 @@ static void *migration_thread(void *opaque)
 
     while (s->state == MIG_STATE_ACTIVE) {
         int64_t current_time;
+		int64_t time_spent;
+		int64_t migration_start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         uint64_t pending_size;
 
         if (!qemu_file_rate_limit(s->file)) {
@@ -594,10 +618,28 @@ static void *migration_thread(void *opaque)
                     break;
                 }
 
-                if (!qemu_file_get_error(s->file)) {
+                //if (!qemu_file_get_error(s->file)) {
+                  if(!qemu_file_get_error(s->file) && !ft_enabled()) {
                     migrate_set_state(s, MIG_STATE_ACTIVE, MIG_STATE_COMPLETED);
                     break;
                 }
+				if (ft_enabled()) {
+					if (old_vm_running) {
+						qemu_mutex_lock_iothread();
+						vm_start();
+						qemu_mutex_unlock_iothread();
+
+						current_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+						time_spent = current_time - migration_start_time;
+						DPRINTF("this migration lasts for %"PRId64"ms\n",
+							time_spent);
+						if (time_spent < time_window) {
+							g_usleep((time_window - time_spent)*1000);
+							initial_time += time_window - time_spent;
+						}
+						qemu_savevm_state_begin(s->file, &s->params);
+					}
+				}
             }
         }
 

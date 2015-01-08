@@ -52,6 +52,8 @@
 #define ARP_PTYPE_IP 0x0800
 #define ARP_OP_REQUEST_REV 0x3
 
+#define PFB_SIZE	0x010000	/* add by wan */
+
 static int announce_self_create(uint8_t *buf,
 				uint8_t *mac_addr)
 {
@@ -135,6 +137,12 @@ struct QEMUFile {
     unsigned int iovcnt;
 
     int last_error;
+
+	/* add by wan (*/
+	uint8_t *pfb;	/* pfb -> PreFetch Buffer */
+	uint64_t pfb_index;
+	uint64_t pfb_size;
+	/* add by wan ) */
 };
 
 typedef struct QEMUFileStdio
@@ -193,6 +201,24 @@ static int socket_get_buffer(void *opaque, uint8_t *buf, int64_t pos, int size)
     return len;
 }
 
+/* add by wan ( */
+static int socket_get_prefetch_buffer(void *opaque, uint8_t *buf,
+											int64_t pos, int size)
+{
+	QEMUFile *f = opaque;
+
+	if (f->pfb_size - pos <= 0) {
+		return 0;
+	}
+
+	if (f->pfb_size - pos < size) {
+		size = f->pfb_size -pos;
+	}
+
+	memcpy(buf, f->pfb_size, size);
+
+	return size;
+}
 static int socket_close(void *opaque)
 {
     QEMUFileSocket *s = opaque;
@@ -440,6 +466,7 @@ QEMUFile *qemu_fdopen(int fd, const char *mode)
 static const QEMUFileOps socket_read_ops = {
     .get_fd =     socket_get_fd,
     .get_buffer = socket_get_buffer,
+    .get_prefetch_buffer = socket_get_prefetch_buffer,
     .close =      socket_close
 };
 
@@ -746,6 +773,12 @@ int qemu_fclose(QEMUFile *f)
     if (f->last_error) {
         ret = f->last_error;
     }
+	/* add by wan ( */
+	if (f->pfb) {
+		g_free(f->pfb);
+	}
+	/* add by wan ) */
+	
     g_free(f);
     return ret;
 }
@@ -828,7 +861,16 @@ void qemu_put_byte(QEMUFile *f, int v)
 }
 
 static void qemu_file_skip(QEMUFile *f, int size)
-{
+{	
+	/* add by wan ( */
+	if (f->pfb_index + size <= f->pfb_size) {
+		f->pfb_index += size;
+		return;
+	} else {
+		size -= f->pfb_size - f->pfb_size;
+		f->pfb_index = f->pfb_size;
+	/* add by wan ) */
+	
     if (f->buf_index + size <= f->buf_size) {
         f->buf_index += size;
     }
@@ -838,7 +880,23 @@ static int qemu_peek_buffer(QEMUFile *f, uint8_t *buf, int size, size_t offset)
 {
     int pending;
     int index;
+	/* add by wan ( */
+	int done;
 
+	if (f->ops->get_prefetch_buffer) {
+		if (f->pfb_index + offset < f->pfb_size) {
+			done = f->ops->get_prefetch_buffer(f, buf, f->pfb_index + offset,
+											size);
+			if (done == size) {
+				return size;
+			}
+			size -= done;
+			buf += done;
+		} else {
+			offset -= f->pfb_size - f->pfb_index;
+		}
+	}
+	/* add by wan ) */
     assert(!qemu_file_is_writable(f));
 
     index = f->buf_index + offset;
@@ -882,8 +940,19 @@ int qemu_get_buffer(QEMUFile *f, uint8_t *buf, int size)
 
 static int qemu_peek_byte(QEMUFile *f, int offset)
 {
-    int index = f->buf_index + offset;
+	/* add by wan ( */
+    /* int index = f->buf_index + offset; */
+	int index;
 
+	if (f->pfb_index + offset < f->pfb_size) {
+		return f->pfb[f->pfb_index + offset];
+	} else {
+		offset -= f->pfb_size - f->pfb_index;
+	}
+
+	index = f->buf_index + offset;
+	/* add by wan ) */
+	
     assert(!qemu_file_is_writable(f));
 
     if (index >= f->buf_size) {
@@ -1849,6 +1918,7 @@ static void vmstate_save(QEMUFile *f, SaveStateEntry *se)
 #define QEMU_VM_SECTION_END          0x03
 #define QEMU_VM_SECTION_FULL         0x04
 #define QEMU_VM_SUBSECTION           0x05
+#define QEMU_VM_EOF_MAGIC			 0Xfeedcafe
 
 bool qemu_savevm_state_blocked(Error **errp)
 {
@@ -2008,6 +2078,9 @@ void qemu_savevm_state_complete(QEMUFile *f)
     }
 
     qemu_put_byte(f, QEMU_VM_EOF);
+	if (ft_enabled()) {
+		qemu_put_be32(f, QEMU_VM_EOF_MAGIC);
+	}
     qemu_fflush(f);
 }
 
@@ -2315,7 +2388,7 @@ int qemu_loadvm_state(QEMUFile *f)
         }
     }
 
-    cpu_synchronize_all_post_init();
+    /*cpu_synchronize_all_post_init();*/ /* add by wan */
 
     ret = 0;
 
@@ -2331,7 +2404,89 @@ out:
 
     return ret;
 }
+/* add by wan ( */
+int qemu_loadvm_state_ft(QEMUFile *f)
+{
+	int ret = 0;
+	int i = 0;
+	int j = 0;
+	int done = 0;
+	uint64_t size = 0;
+	uint64_t count = 0;
+	uint8_t *pfb = NULL;
+	uint8_t *buf = NULL;
 
+	uint4_t max_mem = last_ram_offset() * 1.5;
+
+	if (!f->ops->get_prefetch_buffer) {
+		fprintf(stderr,"Fault tolerant is not supported by this protocol.\n")
+		return EINVAL;
+	}
+
+	size = PFB_SIZE;
+	pfb = g_malloc(size);
+
+	while (true) {
+		if (count + TARGET_PAGE_SIZE >= size) {
+			if (size * 2 > max_mem) {
+				fprintf(stderr, "qemu_loadvm_state_ft: warning:" \
+					"Prefetch buffer becomes too large.\n" \
+					"Fault tolerant is unstable when you see this,\n" \
+					"Please increase the bandwidth or increase" \
+					"the max down time.\n");
+				break;
+			}
+			size = size * 2;
+			buf = g_try_realloc(pfb, size);
+			if (!buf) {
+				error_report("qemu_loadvm_state_ft: out of memory.\n");
+				g_free(pfb);
+				return ENOMEM;
+			}
+			pfb = buf;
+		}
+
+		done = qemu_get_buffer(f, pfb + count, TARGET_PAGE_SIZE);
+
+		ret = qemu_file_get_error(f);
+		if (ret != 0) {
+			g_free(pfb);
+			return ret;
+		}
+
+		buf = pfb + count;
+		count += done;
+		for (i = 0; i < done; i++) {
+			if (buf[i] != 0xfe) {
+				continue;
+			}
+			if (buf[i-1] != 0xCa) {
+				continue;
+			}
+			if (buf[i-2]!= 0xed) {
+				continue;
+			}
+			if (buf[i-3] == 0xFe) {
+				goto out;
+			}
+		}
+	}
+out:
+	if (f->pfb) {
+		free(f->pfb);
+	}
+	f->pfb_size = count;
+	f->pfb_index = 0;
+	f->pfb = pfb;
+
+	ret = qemu_loadvm_state(f);
+
+	/* Skip magic number */
+	qemu_get_be32(f);
+
+	retrun ret;
+}
+/* add by wan ) */
 static BlockDriverState *find_vmstate_bs(void)
 {
     BlockDriverState *bs = NULL;
@@ -2443,6 +2598,7 @@ void do_savevm(Monitor *mon, const QDict *qdict)
         goto the_end;
     }
     ret = qemu_savevm_state(f);
+	cpu_synchronize_all_post_init(); /* add by wan */
     vm_state_size = qemu_ftell(f);
     qemu_fclose(f);
     if (ret < 0) {

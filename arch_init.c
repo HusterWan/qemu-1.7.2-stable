@@ -610,10 +610,17 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
 {
     RAMBlock *block;
     int64_t ram_pages = last_ram_offset() >> TARGET_PAGE_BITS;
+	bool create = false;
 
-    migration_bitmap = bitmap_new(ram_pages);
+    /*migration_bitmap = bitmap_new(ram_pages);
     bitmap_set(migration_bitmap, 0, ram_pages);
-    migration_dirty_pages = ram_pages;
+    migration_dirty_pages = ram_pages;*/
+    if (!ft_enabled() || !migration_bitmap) {
+		migration_bitmap = bitmap_new(ram_pages);
+		bitmap_set(migration_bitmap, 0, ram_pages);
+		migration_dirty_pages = ram_pages;
+		create = true;
+    }
     mig_throttle_on = false;
     dirty_rate_high_cnt = 0;
 
@@ -633,7 +640,10 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
     qemu_mutex_lock_iothread();
     qemu_mutex_lock_ramlist();
     bytes_transferred = 0;
-    reset_ram_globals();
+    //reset_ram_globals();
+    if (!ft_enabled() || create) {
+		reset_ram_globals();
+    }
 
     memory_global_dirty_log_start();
     migration_bitmap_sync();
@@ -748,7 +758,10 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     }
 
     ram_control_after_iterate(f, RAM_CONTROL_FINISH);
-    migration_end();
+    //migration_end();
+    if (!ft_enabled()) {
+		migration_end();
+    }
 
     qemu_mutex_unlock_ramlist();
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
